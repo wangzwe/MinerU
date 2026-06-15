@@ -204,7 +204,7 @@ def doc_analyze_streaming(
             )
             return
 
-        window_size = get_processing_window_size(default=64)
+        window_size = get_processing_window_size(default=256)
         total_batches = (total_pages + window_size - 1) // window_size
         logger.info(
             f'Pipeline processing-window multi-file run. doc_count={len(doc_contexts)}, '

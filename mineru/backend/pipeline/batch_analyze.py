@@ -370,7 +370,8 @@ class BatchAnalyze:
         images_layout_res += run_layout_inference(
             self.model.layout_model.batch_predict,
             pil_images,
-            batch_size=min(8, self.batch_ratio * LAYOUT_BASE_BATCH_SIZE),
+            batch_size=64,
+            # batch_size=min(8, self.batch_ratio * LAYOUT_BASE_BATCH_SIZE),
         )
         # 清理显存
         clean_vram(self.model.device, vram_threshold=8)
