@@ -3,6 +3,8 @@ import copy
 import math
 from typing import Optional, Dict, Any, Tuple
 
+import acl
+from ais_bench.infer.interface import InferSession
 import cv2
 import numpy as np
 
@@ -22,6 +24,32 @@ from.utils_table_recover import (
 )
 
 
+class OMInferSession:
+    """OM (Offline Model) inference session for Huawei Ascend NPU"""
+
+    def __init__(self, config: Dict[str, Any]):
+        
+
+        self.origin_context, ret = acl.rt.get_context()
+
+        model_path = config.get("om_model_path", config.get("model_path").rsplit(".", 1)[0] + ".om")
+        if not model_path:
+            raise ValueError("om_model_path is required")
+
+        device_id = config.get("device_id", 0)
+
+        self.session = InferSession(device_id=device_id, model_path=model_path)
+        ret = acl.rt.set_context(self.origin_context)
+
+    def __call__(self, input_content: np.ndarray) -> np.ndarray:
+        # OM inference: session.infer(feeds=[input],mode="static")
+        input_content = input_content.squeeze(0)
+
+        om_out = self.session.infer([input_content], mode="dymshape", custom_sizes=100000000)
+        ret = acl.rt.set_context(self.origin_context)
+        return om_out
+
+
 class TSRUnet:
     def __init__(self, config: Dict):
         self.K = 1000
@@ -31,10 +59,11 @@ class TSRUnet:
         self.inp_height = 1024
         self.inp_width = 1024
 
-        config["intra_op_num_threads"] = get_op_num_threads("MINERU_INTRA_OP_NUM_THREADS")
-        config["inter_op_num_threads"] = get_op_num_threads("MINERU_INTER_OP_NUM_THREADS")
-
-        self.session = OrtInferSession(config)
+        self.use_om = True
+        if self.use_om:
+            self.session = OMInferSession(config)
+        else:
+            self.session = OrtInferSession(config)
 
     def __call__(
         self, img: np.ndarray, **kwargs
