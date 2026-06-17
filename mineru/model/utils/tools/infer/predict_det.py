@@ -8,8 +8,7 @@ from ...pytorchocr.base_ocr_v20 import BaseOCRV20
 from . import pytorchocr_utility as utility
 from ...pytorchocr.data import create_operators, transform
 from ...pytorchocr.postprocess import build_post_process
-
-
+import torch.nn.functional as F
 class TextDetector(BaseOCRV20):
     def __init__(self, args, **kwargs):
         self.args = args
@@ -110,6 +109,11 @@ class TextDetector(BaseOCRV20):
             print("unknown det_algorithm:{}".format(self.det_algorithm))
             sys.exit(0)
 
+        self.shape = (3, 1, 1) 
+        self.mean_ = np.array([0.485, 0.456, 0.406]).reshape(self.shape).astype('float32')
+        self.std = np.array([0.229, 0.224, 0.225]).reshape(self.shape).astype('float32')
+        self.scale = torch.from_numpy(np.float32(1.0 / 255.0) / self.std).to(self.device)
+        self.mean =  torch.from_numpy(self.mean_ / self.std).to(self.device)
         self.preprocess_op = create_operators(pre_process_list)
         self.postprocess_op = build_post_process(postprocess_params)
 
@@ -148,85 +152,203 @@ class TextDetector(BaseOCRV20):
                 total_elapse: 总耗时
             """
         starttime = time.time()
-
+        
         # 预处理所有图像
         batch_data = []
         batch_shapes = []
         ori_imgs = []
-
-        for img in img_list:
-            ori_im = img.copy()
-            ori_imgs.append(ori_im)
-
-            data = {'image': img}
-            data = transform(data, self.preprocess_op)
-            if data is None:
-                # 如果预处理失败，返回空结果
-                return [(None, 0) for _ in img_list], 0
-
-            img_processed, shape_list = data
-            batch_data.append(img_processed)
-            batch_shapes.append(shape_list)
-
-        # 堆叠成批处理张量
-        try:
-            batch_tensor = np.stack(batch_data, axis=0)
-            batch_shapes = np.stack(batch_shapes, axis=0)
-        except Exception as e:
-            # 如果堆叠失败，回退到逐个处理
-            batch_results = []
-            for img in img_list:
-                dt_boxes, elapse = self.__call__(img)
-                batch_results.append((dt_boxes, elapse))
-            return batch_results, time.time() - starttime
-
-        # 批处理推理
-        with torch.no_grad():
-            inp = torch.from_numpy(batch_tensor)
-            inp = inp.to(self.device)
-            outputs = self.net(inp)
-
-        # 处理输出
-        preds = {}
-        if self.det_algorithm == "EAST":
-            preds['f_geo'] = outputs['f_geo'].cpu().numpy()
-            preds['f_score'] = outputs['f_score'].cpu().numpy()
-        elif self.det_algorithm == 'SAST':
-            preds['f_border'] = outputs['f_border'].cpu().numpy()
-            preds['f_score'] = outputs['f_score'].cpu().numpy()
-            preds['f_tco'] = outputs['f_tco'].cpu().numpy()
-            preds['f_tvo'] = outputs['f_tvo'].cpu().numpy()
-        elif self.det_algorithm in ['DB', 'PSE', 'DB++']:
-            preds['maps'] = outputs['maps'].cpu().numpy()
-        elif self.det_algorithm == 'FCE':
-            for i, (k, output) in enumerate(outputs.items()):
-                preds['level_{}'.format(i)] = output.cpu().numpy()
-        else:
-            raise NotImplementedError
-
-        # 后处理每个图像的结果
-        batch_results = []
-        total_elapse = time.time() - starttime
-
-        for i in range(len(img_list)):
-            # 提取单个图像的预测结果
-            single_preds = {}
-            for key, value in preds.items():
-                if isinstance(value, np.ndarray):
-                    single_preds[key] = value[i:i + 1]  # 保持批次维度
+        shape = img_list[0].shape
+        t=time.time()
+        if len(img_list) > 1 and   all(x.shape == shape for x in img_list):
+            h, w, c = img_list[0].shape
+            if max(h, w) > self.args.det_limit_side_len:
+                if h > w:
+                    ratio = float(self.args.det_limit_side_len) / h
                 else:
-                    single_preds[key] = value
+                    ratio = float(self.args.det_limit_side_len) / w
+            else:
+                ratio = 1.           
+            resize_h = int(h * ratio)
+            resize_w = int(w * ratio)
 
-            # 后处理
-            post_result = self.postprocess_op(single_preds, batch_shapes[i:i + 1])
-            dt_boxes = post_result[0]['points']
+            if max(resize_h, resize_w) > self.args.det_max_side_limit:
+                ratio = float(self.args.det_max_side_limit) / max(resize_h, resize_w)
+                resize_h = int(resize_h * ratio)
+                resize_w = int(resize_w * ratio)
 
-            # 过滤和裁剪检测框
-            dt_boxes = self._filter_det_res(dt_boxes, ori_imgs[i].shape)
+            resize_h = max(int(round(resize_h / 32) * 32), 32)
+            resize_w = max(int(round(resize_w / 32) * 32), 32)
+            ratio_h = resize_h / float(h)
+            ratio_w = resize_w / float(w)
+            shape = np.array([h, w, ratio_h, ratio_w])
+            batch_shapes = batch_shapes = [shape] * len(img_list)
+            try:
+                if int(resize_w) <= 0 or int(resize_h) <= 0:
+                    return None, (None, None)
+                batch_numpy = np.stack(img_list, axis=0)
+                # img = cv2.resize(img, (int(resize_w), int(resize_h)))
+                tensor_bchw = torch.from_numpy(batch_numpy).permute(0, 3, 1, 2).float().to(self.device)
+                print(tensor_bchw.shape)
+                chunk_size = 32#超参数
+                if tensor_bchw.shape[-1]==int(resize_h) and tensor_bchw.shape[-2]==int(resize_h):
+                    final_tensor = tensor_bchw* self.scale - self.mean
+                else:
 
-            batch_results.append((dt_boxes, total_elapse / len(img_list)))
+                    resized_list = []
 
-        return batch_results, total_elapse
+                    for i in range(0, len(img_list), chunk_size):
+                        # 利用张量切片，获取一小批数据
+                        chunk_tensor = tensor_bchw[i : i + chunk_size]
+                        
+                        # 在 NPU 上对这一小批进行 Resize
+                        # 此时显存峰值大幅降低
+                        resized_chunk = F.interpolate(
+                            chunk_tensor, 
+                            size=(int(resize_h), int(resize_w)), 
+                            mode='bilinear', 
+                            align_corners=False
+                        )
+                        resized_list.append(resized_chunk)
+                
+                    # 拼接回来，得到最终的 [128, 3, 224, 224]
+                    final_tensor = torch.cat(resized_list, dim=0)* self.scale - self.mean
+
+                print("final_tensor shape",final_tensor.shape)
+                with torch.no_grad():
+                    outputs = self.net(final_tensor) 
+                preds = {}
+                if self.det_algorithm == "EAST":
+                    preds['f_geo'] = outputs['f_geo'].cpu().numpy()
+                    preds['f_score'] = outputs['f_score'].cpu().numpy()
+                elif self.det_algorithm == 'SAST':
+                    preds['f_border'] = outputs['f_border'].cpu().numpy()
+                    preds['f_score'] = outputs['f_score'].cpu().numpy()
+                    preds['f_tco'] = outputs['f_tco'].cpu().numpy()
+                    preds['f_tvo'] = outputs['f_tvo'].cpu().numpy()
+                elif self.det_algorithm in ['DB', 'PSE', 'DB++']:
+                    t3=time.time()
+                    print("输出shape",outputs['maps'].shape)
+                    preds['maps'] = outputs['maps'].cpu().numpy()
+                    print("cpu_numpy",time.time()-t3) 
+                elif self.det_algorithm == 'FCE':
+                    for i, (k, output) in enumerate(outputs.items()):
+                        preds['level_{}'.format(i)] = output.cpu().numpy()
+                else:
+                    raise NotImplementedError
+
+                # 后处理每个图像的结果
+                batch_results = []
+                total_elapse = time.time() - starttime
+                t4=time.time()
+
+                for i in range(len(img_list)):
+                    # 提取单个图像的预测结果
+                    single_preds = {}
+                    for key, value in preds.items():
+                        if isinstance(value, np.ndarray):
+                            single_preds[key] = value[i:i + 1]  # 保持批次维度
+                        else:
+                            single_preds[key] = value
+
+                    # 后处理
+                    post_result = self.postprocess_op(single_preds, batch_shapes[i:i + 1])
+                    dt_boxes = post_result[0]['points']
+
+                    # 过滤和裁剪检测框
+                    dt_boxes = self._filter_det_res(dt_boxes, shape)
+
+                    batch_results.append((dt_boxes, total_elapse / len(img_list)))
+                return batch_results, total_elapse
+
+            except:
+                print("#################",img_list[0].shape, resize_w, resize_h)
+                sys.exit(0)
+        else:    
+            for img in img_list:
+                ori_im = img.copy()
+                ori_imgs.append(ori_im)
+                t_transform=time.time()
+                data = {'image': img}
+                data = transform(data, self.preprocess_op)
+                print("t_transform",time.time()-t_transform)
+
+                if data is None:
+                    # 如果预处理失败，返回空结果
+                    return [(None, 0) for _ in img_list], 0
+
+                img_processed, shape_list = data
+                batch_data.append(img_processed)
+                batch_shapes.append(shape_list)
+            # preprocess
+            # t=time.time()
+            print("preprocess",time.time()-t)
+            # 堆叠成批处理张量
+            t=time.time()
+
+            try:
+                
+                batch_tensor = np.stack(batch_data, axis=0)
+                batch_shapes = np.stack(batch_shapes, axis=0)
+                batch_tensor = np.ascontiguousarray(batch_tensor)
+                batch_shapes = np.ascontiguousarray(batch_shapes)
+                print("stack",time.time()-t)
+            except Exception as e:
+                # 如果堆叠失败，回退到逐个处理
+                batch_results = []
+                for img in img_list:
+                    dt_boxes, elapse = self.__call__(img)
+                    batch_results.append((dt_boxes, elapse))
+                return batch_results, time.time() - starttime
+
+            # 批处理推理
+            with torch.no_grad():
+                inp = torch.from_numpy(batch_tensor)
+                inp = inp.to(self.device)
+                outputs = self.net(inp)
+            # 处理输出
+            preds = {}
+            if self.det_algorithm == "EAST":
+                preds['f_geo'] = outputs['f_geo'].cpu().numpy()
+                preds['f_score'] = outputs['f_score'].cpu().numpy()
+            elif self.det_algorithm == 'SAST':
+                preds['f_border'] = outputs['f_border'].cpu().numpy()
+                preds['f_score'] = outputs['f_score'].cpu().numpy()
+                preds['f_tco'] = outputs['f_tco'].cpu().numpy()
+                preds['f_tvo'] = outputs['f_tvo'].cpu().numpy()
+            elif self.det_algorithm in ['DB', 'PSE', 'DB++']:
+                t3=time.time()
+                preds['maps'] = outputs['maps'].cpu().numpy()
+                print("cpu_numpy",time.time()-t3) 
+            elif self.det_algorithm == 'FCE':
+                for i, (k, output) in enumerate(outputs.items()):
+                    preds['level_{}'.format(i)] = output.cpu().numpy()
+            else:
+                raise NotImplementedError
+
+            # 后处理每个图像的结果
+            batch_results = []
+            total_elapse = time.time() - starttime
+            t4=time.time()
+
+            for i in range(len(img_list)):
+                # 提取单个图像的预测结果
+                single_preds = {}
+                for key, value in preds.items():
+                    if isinstance(value, np.ndarray):
+                        single_preds[key] = value[i:i + 1]  # 保持批次维度
+                    else:
+                        single_preds[key] = value
+
+                # 后处理
+                post_result = self.postprocess_op(single_preds, batch_shapes[i:i + 1])
+                dt_boxes = post_result[0]['points']
+
+                # 过滤和裁剪检测框
+                dt_boxes = self._filter_det_res(dt_boxes, ori_imgs[i].shape)
+
+                batch_results.append((dt_boxes, total_elapse / len(img_list)))
+            print("后处理每个图像的结果",time.time()-t4) 
+            return batch_results, total_elapse
 
     def batch_predict(self, img_list, max_batch_size=8):
         """
@@ -248,7 +370,10 @@ class TextDetector(BaseOCRV20):
         for i in range(0, len(img_list), max_batch_size):
             batch_imgs = img_list[i:i + max_batch_size]
             # assert尺寸一致
+            t5 = time.time()
             batch_dt_boxes, batch_elapse = self._batch_process_same_size(batch_imgs)
+            print("_batch_process_same_size",time.time()-t5) 
+
             batch_results.extend(batch_dt_boxes)
 
         return batch_results
