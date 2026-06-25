@@ -489,7 +489,7 @@ def doc_analyze_streaming(
             )
             return
 
-        window_size = get_processing_window_size(default=64)
+        window_size = get_processing_window_size(default=256)
         total_batches = (total_pages + window_size - 1) // window_size
         prefetch_enabled = _get_pipeline_pdf_render_prefetch_enabled()
 
