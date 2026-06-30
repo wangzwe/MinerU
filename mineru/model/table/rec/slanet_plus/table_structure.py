@@ -19,6 +19,7 @@ import acl
 from ais_bench.infer.interface import InferSession
 
 from mineru.utils.os_env_config import get_op_num_threads
+from mineru.utils.enum_class import ModelPath
 from .table_structure_utils import (
     OrtInferSession,
     TableLabelDecode,
@@ -32,7 +33,7 @@ class OMInferSession:
     def __init__(self, config: Dict[str, Any]):
         self.origin_context, ret = acl.rt.get_context()
 
-        model_path = config.get("om_model_path", config.get("model_path").rsplit(".", 1)[0] + ".om")
+        model_path = config.get("om_model_path", ModelPath.slanet_plus_om)
         if not model_path:
             raise ValueError("om_model_path is required")
 
