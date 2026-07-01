@@ -26,6 +26,7 @@ from transformers.models.rt_detr.modeling_rt_detr import RTDetrForObjectDetectio
 from transformers.utils import ModelOutput
 
 from mineru.utils.bbox_utils import normalize_to_int_bbox
+from mineru.utils.enum_class import ModelPath
 
 import time
 import cv2
@@ -919,7 +920,7 @@ class PPDocLayoutV2LayoutModel:
         self.use_om = True
         if self.use_om:
             om_config = {
-                "om_model_path": "/mnt_juntuan/s30056203/Mineru-Workspace2/onnx_models/pp_doclayout_v2.om",
+                "om_model_path": ModelPath.pp_doclayout_v2_om,
                 "device_id": 0,
                 "device": self.device
             }

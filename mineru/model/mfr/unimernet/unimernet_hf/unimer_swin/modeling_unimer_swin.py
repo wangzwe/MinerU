@@ -42,6 +42,7 @@ from transformers.utils import (
     torch_int,
 )
 from .configuration_unimer_swin import UnimerSwinConfig
+from mineru.utils.enum_class import ModelPath
 
 
 logger = logging.get_logger(__name__)
@@ -1022,7 +1023,7 @@ class UnimerSwinModel(UnimerSwinPreTrainedModel):
         self.use_om = getattr(config, "use_om", True)
         self.session = None
         if self.use_om:
-            om_model_path = getattr(config, "om_model_path", "onnx_export/my_onnx2/encoder_model.om")
+            om_model_path = getattr(config, "om_model_path", ModelPath.encoder_model_om)
             self.session = OMInferSession({
                 "om_model_path": om_model_path,
                 "device_id": getattr(config, "device_id", 0)

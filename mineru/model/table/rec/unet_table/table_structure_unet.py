@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from mineru.utils.os_env_config import get_op_num_threads
+from mineru.utils.enum_class import ModelPath
 from .utils import OrtInferSession, resize_img
 from .utils_table_line_rec import (
     get_table_line,
@@ -32,7 +33,7 @@ class OMInferSession:
 
         self.origin_context, ret = acl.rt.get_context()
 
-        model_path = config.get("om_model_path", config.get("model_path").rsplit(".", 1)[0] + ".om")
+        model_path = config.get("om_model_path", ModelPath.unet_structure_om)
         if not model_path:
             raise ValueError("om_model_path is required")
 
