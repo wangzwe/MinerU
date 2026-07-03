@@ -94,7 +94,7 @@ async def parse_request_form(
 - hybrid-auto-engine: Next-generation high accuracy solution via local computing power, supports multiple languages.
 - hybrid-http-client: High accuracy via remote computing power but requires a little local computing power(client suitable for openai-compatible servers), supports multiple languages.""",
         ),
-    ] = "hybrid-auto-engine",
+    ] = "pipeline",
     parse_method: Annotated[
         str,
         Form(
@@ -175,6 +175,16 @@ async def parse_request_form(
     ] = 99999,
 ) -> ParseRequestOptions:
     """解析 API/Router 共用的 multipart 表单，并保持 Swagger 参数同源。"""
+
+    # Force this mineru-api service to use pipeline backend only.
+    # 1. If the client does not pass backend, the default value above is "pipeline".
+    # 2. If the client explicitly passes any non-pipeline backend, reject it here.
+    if backend != "pipeline":
+        raise HTTPException(
+            status_code=400,
+            detail="Only pipeline backend is allowed in this service.",
+        )
+
     validate_public_http_client_request(
         public_bind_exposed=bool(
             getattr(request.app.state, "public_bind_exposed", False)
