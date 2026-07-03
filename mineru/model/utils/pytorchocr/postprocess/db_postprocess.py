@@ -3,15 +3,25 @@
 This code is refered from:
 https://github.com/WenmuZhou/DBNet.pytorch/blob/master/post_processing/seg_detector_representer.py
 """
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 import numpy as np
 import cv2
 import torch
 from shapely.geometry import Polygon
 import pyclipper
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def _is_device_tensor(tensor):
+    """Check whether the tensor is on a non-CPU device (NPU/CUDA etc.)"""
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    return tensor.device.type not in ('cpu', '') and str(tensor.device) != 'cpu'
 
 
 class DBPostProcess(object):
@@ -42,20 +52,23 @@ class DBPostProcess(object):
         self.dilation_kernel = None if not use_dilation else np.array(
             [[1, 1], [1, 1]])
 
-    def polygons_from_bitmap(self, pred, _bitmap, dest_width, dest_height):
-        """
-        _bitmap: single map with shape (1, H, W),
-            whose values are binarized as {0, 1}
-        """
+        self._executor = None
 
+    @property
+    def executor(self):
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=min(os.cpu_count(), 8))
+        return self._executor
+
+    def polygons_from_bitmap(self, pred, _bitmap, dest_width, dest_height):
         bitmap = _bitmap
-        height, width = bitmap.shape
+        height, width = bitmap.shape[:2]
 
         boxes = []
         scores = []
 
         contours, _ = cv2.findContours(
-            (bitmap * 255).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            bitmap, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
         for contour in contours[:self.max_candidates]:
             epsilon = 0.002 * cv2.arcLength(contour, True)
@@ -93,18 +106,13 @@ class DBPostProcess(object):
         return boxes, scores
 
     def boxes_from_bitmap(self, pred, _bitmap, dest_width, dest_height):
-        '''
-        _bitmap: single map with shape (1, H, W),
-                whose values are binarized as {0, 1}
-        '''
-
         bitmap = _bitmap
-        height, width = bitmap.shape
+        height, width = bitmap.shape[:2]
 
-        outs = cv2.findContours((bitmap * 255).astype(np.uint8), cv2.RETR_LIST,
+        outs = cv2.findContours(bitmap, cv2.RETR_LIST,
                                 cv2.CHAIN_APPROX_SIMPLE)
         if len(outs) == 3:
-            img, contours, _ = outs[0], outs[1], outs[2]
+            contours, _ = outs[1], outs[2]
         elif len(outs) == 2:
             contours, _ = outs[0], outs[1]
 
@@ -179,10 +187,10 @@ class DBPostProcess(object):
         '''
         h, w = bitmap.shape[:2]
         box = _box.copy()
-        xmin = np.clip(np.floor(box[:, 0].min()).astype(np.int if 'int' in np.__dict__ else np.int32), 0, w - 1)
-        xmax = np.clip(np.ceil(box[:, 0].max()).astype(np.int if 'int' in np.__dict__ else np.int32), 0, w - 1)
-        ymin = np.clip(np.floor(box[:, 1].min()).astype(np.int if 'int' in np.__dict__ else np.int32), 0, h - 1)
-        ymax = np.clip(np.ceil(box[:, 1].max()).astype(np.int if 'int' in np.__dict__ else np.int32), 0, h - 1)
+        xmin = np.clip(np.floor(box[:, 0].min()).astype(np.int32), 0, w - 1)
+        xmax = np.clip(np.ceil(box[:, 0].max()).astype(np.int32), 0, w - 1)
+        ymin = np.clip(np.floor(box[:, 1].min()).astype(np.int32), 0, h - 1)
+        ymax = np.clip(np.ceil(box[:, 1].max()).astype(np.int32), 0, h - 1)
 
         mask = np.zeros((ymax - ymin + 1, xmax - xmin + 1), dtype=np.uint8)
         box[:, 0] = box[:, 0] - xmin
@@ -211,30 +219,72 @@ class DBPostProcess(object):
         cv2.fillPoly(mask, contour.reshape(1, -1, 2).astype(np.int32), 1)
         return cv2.mean(bitmap[ymin:ymax + 1, xmin:xmax + 1], mask)[0]
 
+    def _process_single_bitmap(self, batch_index, pred_single, bitmap_single, src_h, src_w):
+        """
+        Process a single bitmap to extract boxes.
+
+        Args:
+            batch_index: batch index
+            pred_single: single image pred, shape [H, W], float (for box_score)
+            bitmap_single: single image binarized bitmap, shape [H, W], 0/255 uint8
+            src_h, src_w: original image height and width
+        """
+        if self.dilation_kernel is not None:
+            mask = cv2.dilate(bitmap_single, self.dilation_kernel)
+        else:
+            mask = bitmap_single
+
+        if self.box_type == 'poly':
+            boxes, scores = self.polygons_from_bitmap(
+                pred_single, mask, src_w, src_h)
+        elif self.box_type == 'quad':
+            boxes, scores = self.boxes_from_bitmap(
+                pred_single, mask, src_w, src_h)
+        else:
+            raise ValueError("box_type can only be one of ['quad', 'poly']")
+
+        return batch_index, boxes, scores
+
     def __call__(self, outs_dict, shape_list):
         pred = outs_dict['maps']
-        if isinstance(pred, torch.Tensor):
-            pred = pred.cpu().numpy()
-        pred = pred[:, 0, :, :]
-        segmentation = pred > self.thresh
 
-        boxes_batch = []
-        for batch_index in range(pred.shape[0]):
-            src_h, src_w, ratio_h, ratio_w = shape_list[batch_index]
-            if self.dilation_kernel is not None:
-                mask = cv2.dilate(
-                    np.array(segmentation[batch_index]).astype(np.uint8),
-                    self.dilation_kernel)
+        if _is_device_tensor(pred):
+            if pred.dim() == 4:
+                pred_squeezed = pred[:, 0, :, :]  # [N, H, W]
             else:
-                mask = segmentation[batch_index]
-            if self.box_type == "poly":
-                boxes, scores = self.polygons_from_bitmap(
-                    pred[batch_index], mask, src_w, src_h)
-            elif self.box_type == "quad":
-                boxes, scores = self.boxes_from_bitmap(
-                    pred[batch_index], mask, src_w, src_h)
-            else:
-                raise ValueError("box_type can only be one of ['quad', 'poly']")
+                pred_squeezed = pred
 
-            boxes_batch.append({'points': boxes})
+            segmentation = pred_squeezed > self.thresh  # bool tensor, still on device
+            bitmaps_np = (segmentation.to(torch.uint8) * 255).cpu().numpy()  # [N, H, W] 0/255 uint8
+
+            pred_np = pred_squeezed.float().cpu().numpy()  # [N, H, W] float32
+        else:
+            # CPU path
+            if isinstance(pred, torch.Tensor):
+                pred = pred.cpu().numpy()
+            pred_np = pred[:, 0, :, :].astype(np.float32) if pred.ndim == 4 else pred.astype(np.float32)
+            segmentation = pred_np > self.thresh
+            bitmaps_np = segmentation.astype(np.uint8) * 255  # [N, H, W] 0/255 uint8
+
+        # Parallelize boxes_from_bitmap per image
+        batch_size = pred_np.shape[0]
+
+        if batch_size <= 1:
+            src_h, src_w, ratio_h, ratio_w = shape_list[0]
+            _, boxes, scores = self._process_single_bitmap(0, pred_np[0], bitmaps_np[0], src_h, src_w)
+            return [{'points': boxes}]
+
+        boxes_batch = [None] * batch_size
+        futures = {}
+
+        for batch_index in range(batch_size):
+            sh, sw, rh, rw = shape_list[batch_index]
+            future = self.executor.submit(
+                self._process_single_bitmap,batch_index, pred_np[batch_index], bitmaps_np[batch_index], sh, sw)
+            futures[future] = batch_index
+
+        for future in as_completed(futures):
+            batch_index, boxes, scores = future.result()
+            boxes_batch[batch_index] = {'points': boxes}
+
         return boxes_batch
