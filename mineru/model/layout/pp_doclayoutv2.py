@@ -6,7 +6,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -26,6 +26,13 @@ from transformers.models.rt_detr.modeling_rt_detr import RTDetrForObjectDetectio
 from transformers.utils import ModelOutput
 
 from mineru.utils.bbox_utils import normalize_to_int_bbox
+from mineru.utils.enum_class import ModelPath
+
+import time
+import cv2
+import acl
+from ais_bench.infer.interface import InferSession
+
 
 DEFAULT_IMAGE_SIZE = (800, 800)
 DEFAULT_RESCALE_FACTOR = 1.0 / 255.0
@@ -910,6 +917,22 @@ class PPDocLayoutV2LayoutModel:
         self.model.to(self.device)
         self.model.eval()
 
+        self.use_om = True
+        if self.use_om:
+            om_config = {
+                "om_model_path": ModelPath.pp_doclayout_v2_om,
+                "device_id": 0,
+                "device": self.device
+            }
+            self.om_session = OMInferSession(om_config)
+        
+        self.cpu_workers = min(4, os.cpu_count() or 1) 
+        if self.cpu_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            self.thread_pool = ThreadPoolExecutor(max_workers=self.cpu_workers)
+        else:
+            self.thread_pool = None
+
     @staticmethod
     def _get_order_seqs(order_logits: torch.Tensor) -> torch.Tensor:
         order_scores = torch.sigmoid(order_logits)
@@ -944,6 +967,76 @@ class PPDocLayoutV2LayoutModel:
         )
         pixel_values = pixel_values.to(dtype=torch.float32) * self.rescale_factor
         return pixel_values, target_size
+    
+    def _resize_single_image(self, img: np.ndarray) -> np.ndarray:
+        """
+        单张图片的 CPU resize。
+        使用 cv2 加速，且 cv2 底层会释放 GIL，支持多线程并行。
+        """
+        # 确保是 HWC 格式的 RGB (3 通道)
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif img.shape[-1] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+        elif img.shape[-1] == 3 and img.dtype != np.uint8:
+            img = img.astype(np.uint8)
+            
+        resized = cv2.resize(
+            img, 
+            (self.imgsz[0], self.imgsz[1]), 
+            interpolation=cv2.INTER_LINEAR
+        )
+        return resized
+
+    def _preprocess_batch_optimized(
+        self, 
+        images: List[Union[np.ndarray, Image.Image]],
+    ) -> Tuple[torch.Tensor, List[Tuple[int, int]]]:
+        """
+        兼容不同尺寸图片的极致优化预处理
+        """
+        target_sizes = []
+        np_images_raw = []
+        
+        # 1. 快速提取 numpy 数组和原始尺寸 (避免在循环中做复杂操作)
+        for img in images:
+            if isinstance(img, Image.Image):
+                img_np = np.array(img.convert("RGB"))
+            elif isinstance(img, np.ndarray):
+                img_np = img
+            else:
+                raise TypeError(f"Unsupported image type: {type(img)}")
+            
+            target_sizes.append((img_np.shape[0], img_np.shape[1]))
+            np_images_raw.append(img_np)
+        
+        # 2. 多线程并行执行 CPU resize
+        if self.thread_pool is not None and len(np_images_raw) > 1:
+            # map 会保持顺序，且利用 cv2 释放 GIL 的特性实现真并行
+            resized_list = list(self.thread_pool.map(self._resize_single_image, np_images_raw))
+        else:
+            resized_list = [self._resize_single_image(img) for img in np_images_raw]
+            
+        # 3. 在 Numpy 层面完成 HWC -> CHW 并保证内存连续
+        chw_tensors = []
+        for img_np in resized_list:
+            img_chw = np.ascontiguousarray(np.transpose(img_np, (2, 0, 1)))
+            chw_tensors.append(torch.from_numpy(img_chw))
+            
+        batch_tensor = torch.stack(chw_tensors, dim=0) # (B, 3, H, W) uint8
+        
+        # 4. 锁页内存 + 异步传输到 GPU
+        batch_tensor = batch_tensor.pin_memory().to(
+            self.device, 
+            dtype=torch.float32, 
+            non_blocking=True
+        )
+        
+        # 5. GPU 上的 rescale，放在 GPU 上批量做乘法，比在 CPU 上逐张做快得多
+        if self.rescale_factor != 1.0:
+            batch_tensor = batch_tensor * self.rescale_factor
+            
+        return batch_tensor, target_sizes
 
     def _post_process_object_detection(
         self,
@@ -1438,15 +1531,20 @@ class PPDocLayoutV2LayoutModel:
             with tqdm(total=len(images), desc="Layout Predict") as pbar:
                 for start in range(0, len(images), batch_size):
                     batch_images = images[start : start + batch_size]
-                    pixel_values_list = []
-                    target_sizes = []
-                    for image in batch_images:
-                        pixel_values, target_size = self._preprocess_single_image(image)
-                        pixel_values_list.append(pixel_values)
-                        target_sizes.append(target_size)
+                    # pixel_values_list = []
+                    # target_sizes = []
+                    # for image in batch_images:
+                    #     pixel_values, target_size = self._preprocess_single_image(image)
+                    #     pixel_values_list.append(pixel_values)
+                    #     target_sizes.append(target_size)
+                    # batch_tensor = torch.stack(pixel_values_list, dim=0).to(self.device)
 
-                    batch_tensor = torch.stack(pixel_values_list, dim=0).to(self.device)
-                    outputs = self.model(pixel_values=batch_tensor)
+                    batch_tensor, target_sizes =  self._preprocess_batch_optimized(batch_images)
+                    if self.use_om:
+                        outputs = self.om_session(pixel_values=batch_tensor)
+                    else:
+                        outputs = self.model(pixel_values=batch_tensor)
+
                     predictions = self._post_process_object_detection(outputs, target_sizes)
                     for prediction, image_size in zip(predictions, target_sizes):
                         layout_res = self._parse_prediction(prediction, image_size)
@@ -1498,6 +1596,42 @@ class PPDocLayoutV2LayoutModel:
                 font=font,
             )
         return image
+
+
+class OMInferSession:
+    """OM (Offline Model) inference session for Huawei Ascend NPU"""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.origin_context, _ = acl.rt.get_context()
+
+        model_path = config.get("om_model_path")
+        if not model_path:
+            raise ValueError("om_model_path is required")
+
+        device_id = config.get("device_id", 0)
+        self.device = config.get("device")
+
+        self.session = InferSession(device_id=device_id, model_path=model_path)
+        _ = acl.rt.set_context(self.origin_context)
+
+    def __call__(
+            self, 
+            pixel_values: torch.FloatTensor
+        ):
+        input_content = [pixel_values.cpu().numpy().astype(np.float32)]
+        om_out = self.session.infer(input_content, mode="dymbatch")
+        _ = acl.rt.set_context(self.origin_context)
+
+        om_logits = torch.from_numpy(om_out[0])
+        om_boxes = torch.from_numpy(om_out[1])
+        om_order = torch.from_numpy(om_out[2])
+
+        result = PPDocLayoutV2ForObjectDetectionOutput(
+            logits=om_logits,
+            pred_boxes=om_boxes,
+            order_logits=om_order
+        )
+        return result
 
 
 __all__ = [

@@ -106,6 +106,12 @@ class ModelPath:
     unet_structure = "models/TabRec/UnetStructure/unet.onnx"
     paddle_table_cls = "models/TabCls/paddle_table_cls/PP-LCNet_x1_0_table_cls.onnx"
 
+    # OM model paths
+    pp_doclayout_v2_om = "/root/mineru_om_models/pp_doclayout_v2.om"
+    encoder_model_om = "/root/mineru_om_models/encoder_model.om"
+    slanet_plus_om = "/root/mineru_om_models/slanet-plus.om"
+    unet_structure_om = "/root/mineru_om_models/unet.om"
+
 
 class SplitFlag:
     CROSS_PAGE = 'cross_page'
