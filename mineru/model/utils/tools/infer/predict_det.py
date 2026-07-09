@@ -148,9 +148,8 @@ class TextDetector(BaseOCRV20):
         super(TextDetector, self).__init__(network_config, **kwargs)
         self.load_pytorch_weights(self.weights_path)
         self.net.eval()
-
-        self._apply_inference_precision(self.device)
-        print(self.device)
+        if self.device != 'cpu':
+            self.net.to(self.device)
 
         for module in self.net.modules():
             if hasattr(module, 'rep'):
@@ -295,7 +294,7 @@ class TextDetector(BaseOCRV20):
 
             t1 = time.perf_counter()
             # print(f"[Kenny Logs] Preprocess spend time: {(t1 - t0)*1000}/ms")
-            outputs = self.net(final_tensor.to(self.ocr_inference_dtype))
+            outputs = self.net(final_tensor)
             t2 = time.perf_counter()
             # print(f"[Kenny Logs] Inference spend time: {(t2 - t1)*1000}/ms")
 
@@ -441,7 +440,6 @@ class TextDetector(BaseOCRV20):
         with torch.inference_mode():
             inp = torch.from_numpy(img)
             inp = inp.to(self.device)
-            inp = self._to_inference_dtype(inp)
             outputs = self.net(inp)
 
         preds = {}
