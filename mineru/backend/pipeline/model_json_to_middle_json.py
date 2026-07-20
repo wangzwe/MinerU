@@ -28,9 +28,10 @@ from mineru.utils.span_pre_proc import (
 def page_model_info_to_page_info(page_model_info, image_dict, page, image_writer, page_index, ocr_enable=False):
     scale = image_dict["scale"]
     page_pil_img = image_dict["img_pil"]
-    page_img_md5 = bytes_md5(page_pil_img.tobytes())
+    # page_img_md5 = bytes_md5(page_pil_img.tobytes())
     with pdfium_guard():
         page_w, page_h = map(int, page.get_size())
+    page_img_md5 = f"{page_index}_{page_w}x{page_h}"
     magic_model = MagicModel(
         page_model_info,
         page,

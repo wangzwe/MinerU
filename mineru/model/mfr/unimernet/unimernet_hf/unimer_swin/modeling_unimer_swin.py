@@ -20,7 +20,11 @@ states."""
 import collections.abc
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+
+from typing import Any, Dict, Optional, Tuple, Union
+import numpy as np
+import acl
+from ais_bench.infer.interface import InferSession
 
 import torch
 import torch.utils.checkpoint
@@ -38,6 +42,7 @@ from transformers.utils import (
     torch_int,
 )
 from .configuration_unimer_swin import UnimerSwinConfig
+from mineru.utils.enum_class import ModelPath
 
 
 logger = logging.get_logger(__name__)
@@ -982,6 +987,20 @@ SWIN_INPUTS_DOCSTRING = r"""
             Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
 """
 
+class OMInferSession:
+    def __init__(self, config: Dict[str, Any]):
+        self.origin_context, ret = acl.rt.get_context()
+
+        model_path = config.get("om_model_path")
+        device_id = config.get("device_id", 0)
+        self.session = InferSession(device_id=device_id, model_path=model_path)
+        ret = acl.rt.set_context(self.origin_context)
+    
+    def __call__(self, pixel_values: np.ndarray) -> np.ndarray:
+        output = self.session.infer([pixel_values], mode="dymshape", custom_sizes=100000000)
+        ret = acl.rt.set_context(self.origin_context)
+        return output
+
 
 @add_start_docstrings(
     "The bare UnimerSwin Model transformer outputting raw hidden-states without any specific head on top.",
@@ -1000,6 +1019,15 @@ class UnimerSwinModel(UnimerSwinPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+        self.use_om = getattr(config, "use_om", True)
+        self.session = None
+        if self.use_om:
+            om_model_path = getattr(config, "om_model_path", ModelPath.encoder_model_om)
+            self.session = OMInferSession({
+                "om_model_path": om_model_path,
+                "device_id": getattr(config, "device_id", 0)
+            })
 
     def get_input_embeddings(self):
         return self.embeddings.patch_embeddings
@@ -1039,6 +1067,25 @@ class UnimerSwinModel(UnimerSwinPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # OM 推理模式
+        if self.use_om and self.session is not None:
+            pixel_values_np = pixel_values.cpu().numpy().astype(np.float32)
+            encoder_hidden_states = self.session(pixel_values_np)[0]
+
+            # 转换 numpy 为 torch tensor
+            if isinstance(encoder_hidden_states, np.ndarray):
+                encoder_hidden_states = torch.from_numpy(encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states.to(pixel_values.device)
+
+            # 构建输出格式（与 PyTorch forward 输出兼容）
+            return UnimerSwinModelOutput(
+                last_hidden_state=encoder_hidden_states,
+                pooler_output=None,
+                hidden_states=None,
+                attentions=None,
+                reshaped_hidden_states=None,
+            )
 
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")

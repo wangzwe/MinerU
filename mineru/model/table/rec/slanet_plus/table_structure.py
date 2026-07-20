@@ -15,8 +15,11 @@ import time
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+import acl
+from ais_bench.infer.interface import InferSession
 
 from mineru.utils.os_env_config import get_op_num_threads
+from mineru.utils.enum_class import ModelPath
 from .table_structure_utils import (
     OrtInferSession,
     TableLabelDecode,
@@ -24,6 +27,25 @@ from .table_structure_utils import (
     BatchTablePreprocess,
 )
 
+class OMInferSession:
+    """OM (Offline Model) inference session for Huawei Ascend NPU"""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.origin_context, ret = acl.rt.get_context()
+
+        model_path = config.get("om_model_path", ModelPath.slanet_plus_om)
+        if not model_path:
+            raise ValueError("om_model_path is required")
+
+        device_id = config.get("device_id", 0)
+
+        self.session = InferSession(device_id=device_id, model_path=model_path)
+        ret = acl.rt.set_context(self.origin_context)
+
+    def __call__(self, input_content: List) -> np.ndarray:
+        om_out = self.session.infer(input_content, mode="dymbatch")
+        ret = acl.rt.set_context(self.origin_context)
+        return om_out
 
 class TableStructurer:
     def __init__(self, config: Dict[str, Any]):
@@ -33,9 +55,13 @@ class TableStructurer:
         config["intra_op_num_threads"] = get_op_num_threads("MINERU_INTRA_OP_NUM_THREADS")
         config["inter_op_num_threads"] = get_op_num_threads("MINERU_INTER_OP_NUM_THREADS")
 
-        self.session = OrtInferSession(config)
-
-        self.character = self.session.get_metadata()
+        self.use_om = config.get("use_om", True)
+        if self.use_om:
+            self.session = OMInferSession(config)
+            self.character = OrtInferSession(config).get_metadata()
+        else:
+            self.session = OrtInferSession(config)
+            self.character = self.session.get_metadata()
         self.postprocess_op = TableLabelDecode(self.character)
 
     def process(self, img):

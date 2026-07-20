@@ -29,8 +29,22 @@ class ConnectedComponent:
         if self._coords is None:
             min_row, min_col, max_row, max_col = self.bbox
             label_roi = self._labels[min_row:max_row, min_col:max_col]
-            ys, xs = np.nonzero(label_roi == self._label_id)
-            self._coords = np.column_stack((ys + min_row, xs + min_col))
+            
+            # 优化：使用 findContours 提取边界点，替代 np.nonzero 提取所有像素点
+            mask = (label_roi == self._label_id).astype(np.uint8)
+            res = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = res[-2]  # 兼容 OpenCV 3 和 4
+            
+            # 确保轮廓点数 >= 3，否则 cv2.minAreaRect 会报错
+            if contours and len(contours[0]) >= 3:
+                pts = contours[0].reshape(-1, 2)
+                # contours[0] 点格式为 (x, y) 即 (col, row)
+                # 转换为 (row, col) 并加上 bbox 的偏移
+                self._coords = pts[:, ::-1] + np.array([min_row, min_col], dtype=pts.dtype)
+            else:
+                # 回退到 np.nonzero，保证极端情况下的点数足够
+                ys, xs = np.nonzero(label_roi == self._label_id)
+                self._coords = np.column_stack((ys + min_row, xs + min_col))
         return self._coords
 
 
