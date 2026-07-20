@@ -32,7 +32,7 @@ from ...utils.ocr_utils import (
 )
 from ...utils.pdf_image_tools import get_crop_np_img
 
-LAYOUT_BASE_BATCH_SIZE = 1
+LAYOUT_BASE_BATCH_SIZE = 4
 MFR_BASE_BATCH_SIZE = 16
 OCR_DET_BASE_BATCH_SIZE = 8
 TABLE_Wired_Wireless_CLS_BATCH_SIZE = 16
@@ -370,8 +370,7 @@ class BatchAnalyze:
         images_layout_res += run_layout_inference(
             self.model.layout_model.batch_predict,
             pil_images,
-            batch_size=64,
-            # batch_size=min(8, self.batch_ratio * LAYOUT_BASE_BATCH_SIZE),
+            batch_size=min(64, self.batch_ratio * LAYOUT_BASE_BATCH_SIZE),
         )
         # 清理显存
         clean_vram(self.model.device, vram_threshold=8)
