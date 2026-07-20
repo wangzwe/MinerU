@@ -194,11 +194,9 @@ class PytorchPaddleOCR(TextSystem):
         kwargs['det_model_path'] = det_model_path
         kwargs['rec_model_path'] = rec_model_path
         kwargs['rec_char_dict_path'] = os.path.join(root_dir, 'pytorchocr', 'utils', 'resources', 'dict', dict_file)
-<<<<<<< HEAD
-        kwargs['rec_batch_num'] = 32
-=======
+
         kwargs['rec_batch_num'] = 16
->>>>>>> 1060a63c (layout切换dymshape；调整batch_size)
+
         if self.is_seal:
             kwargs['det_limit_side_len'] = 736
             kwargs['det_limit_type'] = 'min'
