@@ -1,12 +1,14 @@
 # Copyright (c) Opendatalab. All rights reserved.
-import copy
 import math
 from typing import Optional, Dict, Any, Tuple
 
+import acl
+from ais_bench.infer.interface import InferSession
 import cv2
 import numpy as np
 
 from mineru.utils.os_env_config import get_op_num_threads
+from mineru.utils.enum_class import ModelPath
 from .utils import OrtInferSession, resize_img
 from .utils_table_line_rec import (
     get_table_line,
@@ -22,6 +24,32 @@ from.utils_table_recover import (
 )
 
 
+class OMInferSession:
+    """OM (Offline Model) inference session for Huawei Ascend NPU"""
+
+    def __init__(self, config: Dict[str, Any]):
+        
+
+        self.origin_context, ret = acl.rt.get_context()
+
+        model_path = config.get("om_model_path", ModelPath.unet_structure_om)
+        if not model_path:
+            raise ValueError("om_model_path is required")
+
+        device_id = config.get("device_id", 0)
+
+        self.session = InferSession(device_id=device_id, model_path=model_path)
+        ret = acl.rt.set_context(self.origin_context)
+
+    def __call__(self, input_content: np.ndarray) -> np.ndarray:
+        # OM inference: session.infer(feeds=[input],mode="static")
+        input_content = input_content.squeeze(0)
+
+        om_out = self.session.infer([input_content], mode="dymshape", custom_sizes=100000000)
+        ret = acl.rt.set_context(self.origin_context)
+        return om_out
+
+
 class TSRUnet:
     def __init__(self, config: Dict):
         self.K = 1000
@@ -31,10 +59,11 @@ class TSRUnet:
         self.inp_height = 1024
         self.inp_width = 1024
 
-        config["intra_op_num_threads"] = get_op_num_threads("MINERU_INTRA_OP_NUM_THREADS")
-        config["inter_op_num_threads"] = get_op_num_threads("MINERU_INTER_OP_NUM_THREADS")
-
-        self.session = OrtInferSession(config)
+        self.use_om = True
+        if self.use_om:
+            self.session = OMInferSession(config)
+        else:
+            self.session = OrtInferSession(config)
 
     def __call__(
         self, img: np.ndarray, **kwargs
@@ -90,26 +119,27 @@ class TSRUnet:
         enhance_box_line = kwargs.get("enhance_box_line", True) if kwargs else True
         morph_close = (
             kwargs.get("morph_close", enhance_box_line) if kwargs else enhance_box_line
-        )  # 是否进行闭合运算以找到更多小的框
+        )
         more_h_lines = (
             kwargs.get("more_h_lines", enhance_box_line) if kwargs else enhance_box_line
-        )  # 是否调整以找到更多的横线
+        )
         more_v_lines = (
             kwargs.get("more_v_lines", enhance_box_line) if kwargs else enhance_box_line
-        )  # 是否调整以找到更多的横线
+        )
         extend_line = (
             kwargs.get("extend_line", enhance_box_line) if kwargs else enhance_box_line
-        )  # 是否进行线段延长使得端点连接
-        # 是否进行旋转修正
+        )
         rotated_fix = kwargs.get("rotated_fix") if kwargs else True
         ori_shape = img.shape
         pred = np.uint8(pred)
-        hpred = copy.deepcopy(pred)  # 横线
-        vpred = copy.deepcopy(pred)  # 竖线
-        whereh = np.where(hpred == 1)
-        wherev = np.where(vpred == 2)
-        hpred[wherev] = 0
-        vpred[whereh] = 0
+
+        # === 优化：用布尔掩码替代 deepcopy + np.where ===
+        # 原版逻辑：deepcopy两份，一份把==2的位置清零得到横线，一份把==1的位置清零得到竖线
+        # 等价于：hpred只有值为1的位置保留（其余为0），vpred只有值为2的位置保留
+        # 结果完全相同：hpred[i,j] = 1 if pred[i,j]==1 else 0
+        #              vpred[i,j] = 2 if pred[i,j]==2 else 0
+        hpred = np.equal(pred, 1).astype(np.uint8)      # 1 where h-line, else 0
+        vpred = np.equal(pred, 2).astype(np.uint8) * 2  # 2 where v-line, else 0
 
         hpred = cv2.resize(hpred, (ori_shape[1], ori_shape[0]))
         vpred = cv2.resize(vpred, (ori_shape[1], ori_shape[0]))
@@ -121,7 +151,7 @@ class TSRUnet:
         vkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_k))
         vpred = cv2.morphologyEx(
             vpred, cv2.MORPH_CLOSE, vkernel, iterations=1
-        )  # 先膨胀后腐蚀的过程
+        )
         if morph_close:
             hpred = cv2.morphologyEx(hpred, cv2.MORPH_CLOSE, hkernel, iterations=1)
         colboxes = get_table_line(vpred, axis=1, lineW=col)  # 竖线
@@ -141,12 +171,20 @@ class TSRUnet:
         if rotated_fix and abs(rotated_angle) > 0.3:
             rotated_line_img = self.rotate_image(line_img, rotated_angle)
             rotated_polygons = self.cal_region_boxes(rotated_line_img)
-            polygons = self.unrotate_polygons(
-                rotated_polygons, rotated_angle, line_img.shape
-            )
+            if rotated_polygons is not None and rotated_polygons.size > 0:
+                polygons = self.unrotate_polygons(
+                    rotated_polygons, rotated_angle, line_img.shape
+                )
+            else:
+                polygons = np.array([], dtype=np.float32)
+                rotated_polygons = np.array([], dtype=np.float32)
         else:
             polygons = self.cal_region_boxes(line_img)
-            rotated_polygons = polygons.copy()
+            if polygons is not None and polygons.size > 0:
+                rotated_polygons = polygons.copy()
+            else:
+                polygons = np.array([], dtype=np.float32)
+                rotated_polygons = np.array([], dtype=np.float32)
         return polygons, rotated_polygons
 
     def cal_region_boxes(self, tmp):
@@ -158,17 +196,15 @@ class TSRUnet:
             tmp.shape[0],
             filtersmall=True,
             adjust_box=False,
-        )  # 最后一个参数改为False
+        )
         return np.array(ceilboxes)
 
     def cal_rotate_angle(self, tmp):
-        # 计算最外侧的旋转框
         contours, _ = cv2.findContours(tmp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return 0
         largest_contour = max(contours, key=cv2.contourArea)
         rect = cv2.minAreaRect(largest_contour)
-        # 计算旋转角度
         angle = rect[2]
         if angle < -45:
             angle += 90
@@ -177,14 +213,11 @@ class TSRUnet:
         return angle
 
     def rotate_image(self, image, angle):
-        # 获取图像的中心点
         (h, w) = image.shape[:2]
         center = (w // 2, h // 2)
 
-        # 计算旋转矩阵
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
 
-        # 进行旋转
         rotated_image = cv2.warpAffine(
             image, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE
         )
@@ -194,18 +227,14 @@ class TSRUnet:
     def unrotate_polygons(
         self, polygons: np.ndarray, angle: float, img_shape: tuple
     ) -> np.ndarray:
-        # 将多边形旋转回原始位置
         (h, w) = img_shape
         center = (w // 2, h // 2)
         M_inv = cv2.getRotationMatrix2D(center, -angle, 1.0)
 
-        # 将 (N, 8) 转换为 (N, 4, 2)
         polygons_reshaped = polygons.reshape(-1, 4, 2)
 
-        # 批量逆旋转
         unrotated_polygons = cv2.transform(polygons_reshaped, M_inv)
 
-        # 将 (N, 4, 2) 转换回 (N, 8)
         unrotated_polygons = unrotated_polygons.reshape(-1, 8)
 
         return unrotated_polygons
