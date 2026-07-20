@@ -1619,11 +1619,9 @@ class OMInferSession:
             pixel_values: torch.FloatTensor
         ):
         input_content = [pixel_values.cpu().numpy().astype(np.float32)]
-<<<<<<< HEAD
-        om_out = self.session.infer(input_content, mode="dymshape", custom_sizes=125000000)
-=======
+
         om_out = self.session.infer(input_content, mode="dymshape",custom_sizes=125000000)
->>>>>>> 1060a63c (layout切换dymshape；调整batch_size)
+
         _ = acl.rt.set_context(self.origin_context)
 
         om_logits = torch.from_numpy(om_out[0])
